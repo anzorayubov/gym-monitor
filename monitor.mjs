@@ -11,6 +11,8 @@ export const ROOT = path.join(os.homedir(), 'Library/Application Support/GymMoni
 const CONFIG = path.join(ROOT, 'config.json');
 const STATE = path.join(ROOT, 'state.json');
 const CONTROL = path.join(ROOT, 'telegram-control.json');
+const GOOGLE_REQUEST = path.join(ROOT, 'google-request.json');
+const GOOGLE_INTERVAL_MS = 10 * 60000;
 const LABEL = 'local.gym-monitor';
 const WATCH_LABEL = LABEL + '.watchdog';
 const WATCH_PLIST = path.join(os.homedir(), 'Library/LaunchAgents', WATCH_LABEL + '.plist');
@@ -290,7 +292,7 @@ export async function pollCommands(c) {
       : command === 'stop'
         ? '✅ Для вас на сегодня уведомления выключены до 00:00 по времени Нячанга. Завтра возобновятся автоматически. Вернуть сейчас: /resume'
         : command === 'start'
-          ? `✅ Вы подписаны на мониторинг ${c.name}. Низкая загрузка: 1–${c.threshold} из 100 после ${c.confirmations} подтверждений. Проверки раз в минуту в часы мониторинга по Нячангу, пока Mac владельца работает. Пауза на сегодня: /stop. Вернуть уведомления: /resume.`
+          ? `✅ Вы подписаны на мониторинг ${c.name}. Низкая загрузка: 1–${c.threshold} из 100 после ${c.confirmations} подтверждений. Проверки Google раз в 10 минут в часы мониторинга по Нячангу, пока Mac владельца работает. Пауза на сегодня: /stop. Вернуть уведомления: /resume.`
           : '✅ Для вас уведомления включены. Действуют обычные пороги и интервалы проверок.';
     try {
       if (update.callback_query) {
@@ -339,12 +341,12 @@ export function decide(previous, sample, c, now = Date.now()) {
     const gap = now - Date.parse(previous.lastCheck);
     const contiguous = previous.latest?.status === 'live' &&
       Number.isFinite(previous.latest.live) && previous.latest.live > 0 &&
-      previous.latest.live <= c.threshold && gap >= 0 && gap <= 3 * 60000;
+      previous.latest.live <= c.threshold && gap >= 0 && gap <= GOOGLE_INTERVAL_MS + 3 * 60000;
     const elapsed = now - Date.parse(previous.lastLowConfirmation);
     if (!contiguous || !s.lowCount || !Number.isFinite(elapsed) || elapsed < 0) {
       s.lowCount = 1;
       s.lastLowConfirmation = new Date(now).toISOString();
-    } else if (elapsed >= 60000) {
+    } else if (elapsed >= 10 * 60000) {
       s.lowCount += 1;
       s.lastLowConfirmation = new Date(now).toISOString();
     }
@@ -369,11 +371,23 @@ export async function check({ dry = false, http = false } = {}) {
       catch { commandsReady = false; }
     };
     if (!dry) await refreshCommands();
+    const paused = !dry && Object.values(subscribers(read(CONTROL), c)).every(s => Date.parse(s.mutedUntil) > Date.now());
+    const outsideHours = !dry && !inHours(c);
+    if (!dry && !paused && !outsideHours) {
+      const lastRequest = Date.parse(read(GOOGLE_REQUEST).requestedAt);
+      const elapsed = Date.now() - lastRequest;
+      if (elapsed >= 0 && elapsed < GOOGLE_INTERVAL_MS) {
+        write(path.join(ROOT, 'heartbeat.json'), { completedAt: new Date().toISOString() });
+        console.log('Google: ожидание следующей проверки (интервал 10 минут)');
+        return;
+      }
+    }
     let sample;
     try {
-      sample = !dry && Object.values(subscribers(read(CONTROL), c)).every(s => Date.parse(s.mutedUntil) > Date.now())
+      if (!paused && !outsideHours) write(GOOGLE_REQUEST, { requestedAt: new Date().toISOString() });
+      sample = paused
         ? { checkedAt: new Date().toISOString(), status: 'paused', live: null }
-        : !dry && !inHours(c)
+        : outsideHours
         ? { checkedAt: new Date().toISOString(), status: 'outside_hours', live: null }
         : c.browserEnabled && !http ? await browserSample(c) : await fetchSample(c);
     } catch (e) { sample = { checkedAt: new Date().toISOString(), status: 'error', live: null, error: e.message }; }
@@ -553,7 +567,7 @@ async function setup() {
       c.threshold = n; c.rearmThreshold = Math.min(100, n + 15);
     }
     write(CONFIG, c);
-    await send(c, `✅ Telegram подключён к мониторингу ${c.name}. Порог: ${c.threshold}/100. Проверка каждую минуту. Доступность live-данных Google проверяется отдельно.`);
+    await send(c, `✅ Telegram подключён к мониторингу ${c.name}. Порог: ${c.threshold}/100. Проверка Google раз в 10 минут. Доступность live-данных Google проверяется отдельно.`);
   } finally {
     rl.close();
   }
