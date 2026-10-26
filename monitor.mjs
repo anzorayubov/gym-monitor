@@ -26,7 +26,7 @@ const DEFAULTS = {
   url: 'https://www.google.com/maps?cid=3443260779864182967&hl=en',
   timezone: 'Asia/Ho_Chi_Minh',
   threshold: 30, rearmThreshold: 45,
-  confirmations: 2, cooldownMinutes: 180,
+  confirmations: 3, cooldownMinutes: 60,
   startHour: 9, endHour: 20,
   // Minutes since midnight, Sunday first. Verified against this venue's Maps card.
   weeklyHours: [[360, 720], [330, 1200], [330, 1200], [330, 1200], [330, 1200], [330, 1200], [330, 1200]],
@@ -63,7 +63,7 @@ function config() {
   const c = { ...DEFAULTS, ...read(CONFIG) };
   if (!Number.isFinite(c.threshold) || c.threshold < 0 || c.threshold > 100 ||
       !Number.isFinite(c.rearmThreshold) || c.rearmThreshold <= c.threshold || c.rearmThreshold > 100 ||
-      !Number.isInteger(c.confirmations) || c.confirmations < 1 ||
+      !Number.isInteger(c.confirmations) || c.confirmations < 3 ||
       !Number.isFinite(c.cooldownMinutes) || c.cooldownMinutes < 0 ||
       !Number.isInteger(c.startHour) || !Number.isInteger(c.endHour) ||
       c.startHour < 0 || c.endHour > 24 || c.startHour >= c.endHour ||
@@ -172,7 +172,7 @@ async function readBrowserPage(page, c, responsePlace = null) {
   const place = embedded(initial);
   return sampleFromPlace(place, 'google_maps_browser');
 }
-async function browserSample(c) {
+export async function browserSample(c, { verifyLive = false } = {}) {
   const context = await chrome();
   const watchdog = setTimeout(() => context.close().catch(() => {}), 70000);
   try {
@@ -204,6 +204,18 @@ async function browserSample(c) {
       await Promise.allSettled([...pending]);
       sample = await readBrowserPage(page, c, responsePlace);
     }
+    if (verifyLive) {
+      try {
+        await page.locator('[aria-label^="Currently "]').first().waitFor({ state: 'visible', timeout: 10000 });
+      } catch { /* A missing rendered live chart must suppress the alert. */ }
+      const labels = [];
+      const bars = page.locator('[aria-label^="Currently "]');
+      for (let i = 0; i < await bars.count(); i++) {
+        const bar = bars.nth(i);
+        if (await bar.isVisible()) labels.push(await bar.getAttribute('aria-label'));
+      }
+      sample = verifyChart(sample, labels);
+    }
     return sample;
   } catch {
     throw new Error('Chrome не смог прочитать карточку. Откройте «Настроить.command» и проверьте вход Google');
@@ -211,6 +223,21 @@ async function browserSample(c) {
     clearTimeout(watchdog);
     await context.close();
   }
+}
+export function verifyChart(sample, labels) {
+  const values = labels.map(label => /^Currently (\d+)% busy, usually \d+% busy\.$/.exec(label ?? ''));
+  const domLive = values.length === 1 && values[0] ? Number(values[0][1]) : null;
+  const chartVerified = sample.status === 'live' && domLive === sample.live && domLive > 0;
+  return { ...sample, checkedAt: new Date().toISOString(), apiLive: sample.live, domLive, chartVerified,
+    ...(chartVerified ? {} : { status: 'no_live_data', live: null,
+      reason: domLive === null ? 'missing_live_chart' : 'live_chart_mismatch' }) };
+}
+export function lowMessage(c, sample) {
+  const time = new Intl.DateTimeFormat('ru-RU', { timeZone: 'Asia/Ho_Chi_Minh',
+    hour: '2-digit', minute: '2-digit', hourCycle: 'h23' })
+    .format(new Date(sample.checkedAt));
+  return `🏋️ ${c.name} — низкая загрузка\n` +
+    `По данным Google: ${sample.live} из 100 на ${time}\n${c.url}`;
 }
 async function telegram(c, method, body) {
   if (!/^\d+:[A-Za-z0-9_-]+$/.test(c.telegramToken)) throw new Error('Токен Telegram не настроен');
@@ -316,19 +343,19 @@ export function decide(previous, sample, c, now = Date.now()) {
   }
   const s = { ...previous, lastCheck: sample.checkedAt, latest: sample };
   if (Date.parse(s.mutedUntil) > now) {
-    s.lowCount = 0; s.lastLowConfirmation = null; s.lowNotified = false;
+    s.lowCount = 0; s.lastLowConfirmation = null; s.firstLowConfirmation = null; s.lowNotified = false;
     // Pausing resets confirmations, but must preserve the alert cooldown.
     s.failures = 0; s.issueNotified = false;
     return { state: s, action: null };
   }
   if (!inHours(c, now) || ['outside_hours', 'closed', 'paused'].includes(sample.status)) {
     s.lowCount = 0;
-    s.lastLowConfirmation = null;
+    s.lastLowConfirmation = null; s.firstLowConfirmation = null;
     return { state: s, action: null };
   }
   if (sample.status !== 'live') {
     s.lowCount = 0;
-    s.lastLowConfirmation = null;
+    s.lastLowConfirmation = null; s.firstLowConfirmation = null;
     s.failures = (s.failures ?? 0) + 1;
     return { state: s, action: s.failures >= 3 && !s.issueNotified ? 'unavailable' : null };
   }
@@ -336,25 +363,26 @@ export function decide(previous, sample, c, now = Date.now()) {
   s.issueNotified = false;
   s.lastLiveAt = sample.checkedAt;
   if (sample.live >= c.rearmThreshold) {
-    s.lowNotified = false; s.lowCount = 0; s.lastLowConfirmation = null;
+    s.lowNotified = false; s.lowCount = 0; s.lastLowConfirmation = null; s.firstLowConfirmation = null;
   } else if (sample.live <= c.threshold) {
     const gap = now - Date.parse(previous.lastCheck);
     const contiguous = previous.latest?.status === 'live' &&
       Number.isFinite(previous.latest.live) && previous.latest.live > 0 &&
       previous.latest.live <= c.threshold && gap >= 0 && gap <= GOOGLE_INTERVAL_MS + 3 * 60000;
     const elapsed = now - Date.parse(previous.lastLowConfirmation);
-    if (!contiguous || !s.lowCount || !Number.isFinite(elapsed) || elapsed < 0) {
+    if (!contiguous || !s.firstLowConfirmation || !s.lowCount || !Number.isFinite(elapsed) || elapsed < 0) {
       s.lowCount = 1;
+      s.firstLowConfirmation = new Date(now).toISOString();
       s.lastLowConfirmation = new Date(now).toISOString();
     } else if (elapsed >= 10 * 60000) {
       s.lowCount += 1;
       s.lastLowConfirmation = new Date(now).toISOString();
     }
-  } else { s.lowCount = 0; s.lastLowConfirmation = null; }
+  } else { s.lowCount = 0; s.lastLowConfirmation = null; s.firstLowConfirmation = null; }
   const cooledDown = !s.lastAlert || now - Date.parse(s.lastAlert) >= c.cooldownMinutes * 60000;
-  return { state: s, action: s.lowCount >= c.confirmations && !s.lowNotified && cooledDown ? 'low' : null };
+  return { state: s, action: s.lowCount >= Math.max(3, c.confirmations) && now - Date.parse(s.firstLowConfirmation) >= 20 * 60000 && !s.lowNotified && cooledDown ? 'low' : null };
 }
-export async function check({ dry = false, http = false } = {}) {
+export async function check({ dry = false, http = false, verifyLive = false } = {}) {
   failureStage = 'config';
   const c = config();
   failureStage = 'lock';
@@ -384,12 +412,13 @@ export async function check({ dry = false, http = false } = {}) {
     }
     let sample;
     try {
-      if (!paused && !outsideHours) write(GOOGLE_REQUEST, { requestedAt: new Date().toISOString() });
+      // Diagnostics must not postpone scheduled checks or their confirmations.
+      if (!dry && !paused && !outsideHours) write(GOOGLE_REQUEST, { requestedAt: new Date().toISOString() });
       sample = paused
         ? { checkedAt: new Date().toISOString(), status: 'paused', live: null }
         : outsideHours
         ? { checkedAt: new Date().toISOString(), status: 'outside_hours', live: null }
-        : c.browserEnabled && !http ? await browserSample(c) : await fetchSample(c);
+        : verifyLive ? await browserSample(c, { verifyLive: true }) : c.browserEnabled && !http ? await browserSample(c) : await fetchSample(c);
     } catch (e) { sample = { checkedAt: new Date().toISOString(), status: 'error', live: null, error: e.message }; }
     if (dry) { console.log(JSON.stringify(sample, null, 2)); return sample; }
     // Chrome can take over a minute; read commands again before sending alerts.
@@ -399,31 +428,62 @@ export async function check({ dry = false, http = false } = {}) {
     const recipients = { ...previous.recipients };
     const actions = {};
     const ready = !!c.telegramToken;
-    for (const [chatId, subscriber] of Object.entries(subscribers(read(CONTROL), c))) {
-      let prior = recipients[chatId] ?? (chatId === String(c.telegramChatId) ? previous : {});
-      // A command resets confirmations for this recipient, preserving the cooldown.
-      if ((prior.revision ?? 0) !== (subscriber.revision ?? 0)) {
-        prior = { ...prior, lowCount: 0, lastLowConfirmation: null, lowNotified: false,
-          failures: 0, issueNotified: false };
+    const applySample = (currentSample) => {
+      for (const [chatId, subscriber] of Object.entries(subscribers(read(CONTROL), c))) {
+        let prior = recipients[chatId] ?? (chatId === String(c.telegramChatId) ? previous : {});
+        if ((prior.revision ?? 0) !== (subscriber.revision ?? 0)) {
+          prior = { ...prior, lowCount: 0, firstLowConfirmation: null, lastLowConfirmation: null,
+            lowNotified: false, failures: 0, issueNotified: false };
+        }
+        const decision = decide({ ...prior, mutedUntil: subscriber.mutedUntil ?? null }, currentSample, c);
+        delete decision.state.recipients;
+        decision.state.revision = subscriber.revision ?? 0;
+        recipients[chatId] = decision.state;
+        actions[chatId] = decision.action;
       }
-      const { state, action } = decide({ ...prior, mutedUntil: subscriber.mutedUntil ?? null }, sample, c);
-      // Legacy owner state can contain the entire recipient map after migration.
-      delete state.recipients;
-      state.revision = subscriber.revision ?? 0;
-      actions[chatId] = action;
-      if (ready && commandsReady && action) {
-        try {
-          if (action === 'low') {
-            await send(c, '🏋️ ' + c.name + ': сейчас низкая загрузка.\nПоказатель: ' + sample.live + ' из 100.', pauseKeyboard, chatId);
-            state.lastAlert = sample.checkedAt; state.lowNotified = true;
-          } else {
-            await send(c, '⚠️ ' + c.name + ': три проверки подряд нет текущих данных Google. Уведомления о низкой загрузке временно невозможны. Владелец мониторинга должен проверить вход через «Настроить.command».\n' + c.url, pauseKeyboard, chatId);
-            state.issueNotified = true;
-          }
-          state.deliveryError = null;
-        } catch (e) { state.deliveryError = e.message; }
+    };
+    applySample(sample);
+    let preflight = null;
+    if (ready && commandsReady && Object.values(actions).includes('low') && inHours(c)) {
+      try {
+        // One fresh Maps navigation for the whole batch, independent of the interval cache.
+        preflight = await browserSample(c, { verifyLive: true });
+      } catch {
+        preflight = { checkedAt: new Date().toISOString(), status: 'error', live: null,
+          reason: 'preflight_failed', chartVerified: false };
       }
-      recipients[chatId] = state;
+      await refreshCommands();
+      sample = preflight;
+      // The fresh read cannot add a timed confirmation. High/missing values reset the series.
+      applySample(sample);
+    }
+    for (const chatId of Object.keys(actions)) {
+      if (!ready || !commandsReady || !actions[chatId]) continue;
+      await refreshCommands();
+      const subscriber = subscribers(read(CONTROL), c)[chatId];
+      let state = recipients[chatId];
+      if (!subscriber || !commandsReady) continue;
+      if ((state.revision ?? 0) !== (subscriber.revision ?? 0) || Date.parse(subscriber.mutedUntil) > Date.now()) {
+        state = { ...state, lowCount: 0, firstLowConfirmation: null, lastLowConfirmation: null,
+          lowNotified: false, failures: 0, issueNotified: false,
+          revision: subscriber.revision ?? 0, mutedUntil: subscriber.mutedUntil ?? null };
+        recipients[chatId] = state;
+        actions[chatId] = null;
+        continue;
+      }
+      if (!inHours(c)) continue;
+      try {
+        if (actions[chatId] === 'low') {
+          if (!preflight?.chartVerified || sample.status !== 'live' || sample.live > c.threshold ||
+              (Date.now() - Date.parse(sample.checkedAt) < 0 || Date.now() - Date.parse(sample.checkedAt) > 60000)) continue;
+          await send(c, lowMessage(c, sample), pauseKeyboard, chatId);
+          state.lastAlert = new Date().toISOString(); state.lowNotified = true;
+        } else {
+          await send(c, '⚠️ ' + c.name + ': три проверки подряд нет текущих данных Google. Уведомления о низкой загрузке временно невозможны. Владелец мониторинга должен проверить вход через «Настроить.command».\n' + c.url, pauseKeyboard, chatId);
+          state.issueNotified = true;
+        }
+        state.deliveryError = null;
+      } catch (e) { state.deliveryError = e.message; }
     }
     const state = { ...previous, ...recipients[String(c.telegramChatId)], latest: sample,
       lastCheck: sample.checkedAt, recipients, telegramConfigured: ready };
@@ -594,7 +654,7 @@ async function main() {
     fs.writeFileSync(path.join(lock, 'complete'), '', { mode: 0o600 });
     console.log('Вход завершён. Автозапуск включится только после успешной проверки live.');
   }
-  else if (command === 'check') await check({ dry: process.argv.includes('--dry-run'), http: process.argv.includes('--http') });
+  else if (command === 'check') await check({ dry: process.argv.includes('--dry-run'), http: process.argv.includes('--http'), verifyLive: process.argv.includes('--verify-live') });
   else if (command === 'stop') { stop(); console.log('Мониторинг остановлен. Для включения — «Настроить.command».'); }
   else if (command === 'uninstall') {
     stop(); if (fs.existsSync(PLIST)) fs.unlinkSync(PLIST);
@@ -613,7 +673,7 @@ async function main() {
       mutedUntil: read(CONTROL).mutedUntil ?? null,
       subscriberCount: Object.keys(subscribers(read(CONTROL), c)).length,
       latest: s.latest ?? null, lastAlert: s.lastAlert ?? null, deliveryError: s.deliveryError ?? null, config: CONFIG }, null, 2));
-  } else throw new Error('Команды: setup, login, finish-login, install, check [--dry-run] [--http], status, stop, uninstall');
+  } else throw new Error('Команды: setup, login, finish-login, install, check [--dry-run] [--http] [--verify-live], status, stop, uninstall');
 }
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   main().catch(e => {
